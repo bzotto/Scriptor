@@ -20,13 +20,15 @@
 ;
 ; Special commands:
 ;   Ctrl-WASD will move the cursor if your keyboard doesn't have arrow keys.
-;   Ctrl-K ("kill") will delete the line the cursor is currently on.
+;   Ctrl-Y ("yank") will delete the line the cursor is currently on.
 ;   Ctrl-V will save the current document to cassette
-;   Crtl-Y will load document from cassette (trashes current document!).
+;   Crtl-B will load document from cassette (trashes current document!).
 ;   Ctrl-P and -L are page up and page down, respectively.
+;   Ctrl-K and -O are home/end (of line), respectively
 ;   
-; There's no hand holding around destructive actions, no undo, and probably a 
-; bunch of bugs in the corner cases. CAVEAT SCRIPTOR. :-)
+; There's not much hand holding around destructive actions, no undo, and probably 
+; a bunch of bugs in the corner cases. CAVEAT SCRIPTOR. :-) Save early, save
+; often.
 ;
 ; Requires: Sphere system with CRT/1 video at $E000; at least 8K of RAM, but
 ; as much as you can afford; KBD/2; PDS-V3N firmware and SYS2NF cassette ROM.
@@ -124,15 +126,17 @@ SCRDOC  EQU     $A2         ; Pointer to the first visible on-screen document li
         ORG     $200
 
 ;
-; Startup setup is very basic. 
+; Load and cold start is at ENTRY. You can try jumping into RESTRT to rescue an
+; active document when you've had to reset the system. 
 ;
 
 ENTRY   LDS     # *-1       ; Ensure the stack is just below the program start. 
         BRA     ENTRY2
 RESTRT  JSR     MRKALL      ; You can jump into the program here to recover current document state. 
         BRA     MAIN_     
-ENTRY2  JSR     HOME        ; Clear the screen
-        JSR     CLEAR
+ENTRY2  JSR     HOMCLR      ; Home & clear the screen
+        JSR     SPLASH
+        JSR     HOMCLR
         JSR     FNDEOM      ; Find and remember the end of useful memory.
         STX     EOFMEM         
         JSR     RSTDOC      ; Reset and create a new document
@@ -140,14 +144,27 @@ ENTRY2  JSR     HOME        ; Clear the screen
         STX     SCRDOC      
         STX     CSRDLN      ; Document cursor to top-left (this matches the screen cursor already at start)
         CLR     CSRDIX
-        JSR     RSTDRT      ; Reset the render dirty flags
+        JSR     RSTDRT      ; Reset dirty state        
                 
 ; Top of the main input loop.
 
 MAIN    JSR     GETCHR      ; Get an input character
         
+        ; Input substitution 
+        CMP A   #'~         ; Replace '~' (on my keyboard) with apostrophe for convenience.
+        BNE     CKALPH
+        LDA A   #''         
+        
+        ; If input is a printable character, go directly to the character input processing. 
+CKALPH  CMP A   #$21        ; '!'
+        BCS     MSPECL
+        CMP A   #$5F        ; '_'
+        BCS     MAINCH
+        
+        ; If not, fall through into specials handling.
+        
         ; Handle input. Walk the command jump table to see if we find a match.
-        CLR B
+MSPECL  CLR B
         LDX     #CMDCHR     ; Start at beginning of command table
 CHSRCH  CPX     #CMDJMP     ; Did we run off the command list?
         BEQ     NOTFND      
@@ -171,13 +188,12 @@ MAIN_   JSR     UPDSCC      ; Update the screen cursor (derive it from the docum
         JSR     RENDER      ; Render whatever needs rendering
         BRA     MAIN        ; Go back up to program loop
 
-NOTFND  ; Input was not in the command table. 
+MAINCH  ; Input was not in the command table. 
         ; Anything else is just a normal character insert.
-        CMP A   #'~         ; This is the ^/~ key on my keyboard for some reason...
-        BNE     NOTNF2
-        LDA A   #''         ; ...map this to apostrophe for convenience.
-NOTNF2  JSR     INSCHR
+        JSR     INSCHR
         BRA     MAIN_        
+   
+NOTFND  BRA     MAIN        ; No command found, just go back for more input.
         
 ; END of MAIN routine/loop!        
 
@@ -192,20 +208,20 @@ NOTNF2  JSR     INSCHR
 GOBKSP  CLR A                   ; We use 0 as delete marker
         JMP     INSDEL          ; Tail call to the insert/delete routine.
             
-; KILLNL: Kill line from the document at the current cursor location. Puts the cursor at the start of the
+; YANKLN: Yank line from the document at the current cursor location. Puts the cursor at the start of the
 ;   "replacement" line.
 ;
-KILLLN  LDX     CSRDLN          ; Load the cursor document line.
+YANKLN  LDX     CSRDLN          ; Load the cursor document line.
         CPX     SCRDOC          ; Are we going to be deleting the first line on screen? If so we need to handle that.
-        BNE     KILL1
+        BNE     YANK1
         CLR     SCRDOC          ; Wipe the high byte from the screen head ptr so we know to replace it later.
-KILL1   JSR     DELL            ; Delete it.
+YANK1   JSR     DELL            ; Delete it.
         STX     CSRDLN          ; Cursor gets start of the replacement line
         CLR     CSRDIX           
         LDA A   SCRDOC          ; Check the high byte which we might have cleared as a flag above
-        BNE     KILLDN
+        BNE     YANKDN
         STX     SCRDOC          ; If we replaced the top screen line, refresh that here
-KILLDN  JSR     MRKFRM          ; Re-render from here down.
+YANKDN  JSR     MRKFRM          ; Re-render from here down.
         RTS
         
 ; PAGEUP: Scroll the text downwards one page, moving the cursor to the top left of the screen.
@@ -344,9 +360,13 @@ INSLP   JSR     RCPOUT      ; COPY-OUT-SHIFT
         BEQ     INSDN       ;  if yes, we are done!
         JSR     RBUFCR      ; is there a hard CR in the buffer?
         BEQ     INSLP       ;  if yes, don't copy in more text, just continue 
-        JSR     RCPYIN      ; copy more text in -- XXX?: If this is a nop-op bc we are end of doc, 
-                            ;   then do we need a way to break out?? Only happens on malformed docs
-        BRA     INSLP       ; back to the top of the loop 
+        JSR     RCPYIN      ; copy more text in 
+        BNE     INSLP       ; back to the top of the loop if copyin did something
+        ; If we ran out of lines to copy in, then copy out until nothing left to copy
+DRAIN   JSR     RCPOUT      ; COPY-OUT-SHIFT
+        JSR     RBUFMT      ; is the reflow buffer empty?
+        BNE     DRAIN       ;  if yes, fall through to finish.        
+
 INSDN   JSR     RECCUR      ; recover the updated cursor (find it in the document)
         RTS
         
@@ -382,7 +402,7 @@ IDCLP   JSR     RBUFCR      ; Does the buffer contain a hard CR?
 IDCLP1  JSR     RBUFMT      ; We want to bring in more text, but if the buffer is empty, we need to stop. 
         BEQ     IDRAIN      ;   If buffer is empty here, a copy in won't do anything for us us. (This probably shouldn't happen.)
         JSR     RCPYIN      ; Bring in more text and go back to top of loop.
-        BRA     IDCLP
+        BNE     IDCLP       ; if copyin runs out of lines, drop through into the drain
 
 IDRAIN  JSR     RCPOUT      ; Copy out a line (we know there's *at least* a hard CR in there...)
         JSR     RBUFMT      ; is the work buffer empty yet?
@@ -450,7 +470,9 @@ SREF3   STX     R1STDS      ; Save as first-destination, too.
         JSR     CLRRFL      ; Clear the reflow buffer
         RTS
 
-; RCPYIN: COPY-IN routine for reflow
+; RCPYIN: COPY-IN routine for reflow.
+; This routine on return sets the zero flag if there were no more source lines to copy in.
+; (Z flag will be clear on return in normal operation)
 ;   
 RCPYIN  JSR     RNXSRC      ; Get next source line start
         CPX     #0          ; Compare to zero.
@@ -484,7 +506,7 @@ RCIN3   LDX     RFLPTR      ; Load the destination ptr
         BNE     RCIN1
 RCINDN  INC     RSRCLN      ; Increment the source-line offset
         INC     RLNSPD      ; Increment lines-pending.
-        RTS
+        RTS                 ; Because the previous line is always incremeting, the Z flag will always be clear.
         
 ; RCPOUT: COPY-OUT-AND-SHIFT routine for reflow
 ;
@@ -492,6 +514,7 @@ RCPOUT  TST     RLNSPD      ; Has lines-pending fallen to zero?
         BNE     RCO2
         JSR     RNXDST      ; Insert a line at the next-destination
         JSR     INSL
+        JSR     MRKFRM      ; Mark the rest of the page as needing refresh, since we are inserting a line.
         INC     RSRCLN      ; Increment next-source by one line to compensate.
         INC     RLNSPD      ; Increment lines-pending 
 RCO2    ; Perform the copy-out
@@ -712,7 +735,7 @@ FEDN0   RTS
 ; document. In the case of screen lines that exist beyond the end of the document,
 ; if marked dirty, the line will be blanked out.
 ;
-; We want to be careful not to be overly liberal with copying to screen-- or blanking
+; We want to be carefully conservative in copying to screen-- or blanking
 ; spare lines, even when it's a no-op-- the video circuit creates "snow" with every
 ; write to video RAM, so we try hard to keep writes to a minimum.
 ;
@@ -1068,7 +1091,21 @@ CSRDN   LDX     CSRDLN
         LDA B   CSRDIX      ; Load the current index
         INC B               ; Pre-increment it so we can run the left scan.
         JMP     CSRLF_      ; Scan left from this location.        
-CSRDN1  LDX     CSRDLN      ; Reload the current line ptr
+CSRDN1  LDX     CSRDLN      ; Reload the current line ptr   
+        JSR     LSTLPT      ;  X to one past end of the line.
+        LDA B   #SCRN_W     ;  B to one past end of the line.
+        JMP     CSRLF_      ;  Left scan!
+
+; CSRHOM: Move the document cursor to the start of the current line.
+;
+CSRHOM  CLR     CSRDIX
+        RTS
+        
+; CSREND: Move the document cursor the end of the current line.
+;   (TODO: This is the same sequence that appears at CSRDN1, could
+;       we just jump there instead?)
+;
+CSREND  LDX     CSRDLN
         JSR     LSTLPT      ;  X to one past end of the line.
         LDA B   #SCRN_W     ;  B to one past end of the line.
         JMP     CSRLF_      ;  Left scan!
@@ -1233,6 +1270,107 @@ RCFIX2  STX     CSRDLN      ; And update the document cursor to match.
 
 ;------------------------------------------------------------------------------
 ;
+; Non-edit UI routines
+;
+;------------------------------------------------------------------------------
+
+; SPLASH: Puts up the program splash dialog
+;
+SPLASH  BSR     MSGBOX
+        LDX     #$E082
+        STX     CURSOR
+        LDX     #STITLE
+        BSR     PUTMSG
+        LDX     #$E0C2
+        STX     CURSOR
+        LDX     #SAUTHR
+        BSR     PUTMSG
+        JSR     GETCHR
+        JMP     MRKALL      ; Tail call to mark screen
+
+; CONFRM: Runs a "confirmation" message box: prints a Y/N question pointed
+; to by string in X, then waits for user to respond. This routine sets the Z
+; flag when the user has said OK, clears it when cancelled. This routine
+; will also mark the screen re-render state so the box clears on the next render
+; pass.
+;
+CONFRM  STX     TEMPX2
+        BSR     MSGBOX
+        LDX     #$E082
+        STX     CURSOR
+        LDX     TEMPX2
+        BSR     PUTMSG
+        LDX     #$E0C2
+        STX     CURSOR
+        LDX     #SYESNO
+        BSR     PUTMSG
+        JSR     GETCHR
+        JSR     MRKALL      ; Before we test the results, mark the screen for re-render.
+        CMP A   #'Y         ; Did the user confirm? Anything but "Y" is no/cancel/esc,
+        RTS        
+      
+; DOMSGB: Does a text message box. Pointer to text in X. This routine draws and 
+; then marks the screen for re-render. The caller is not expected to return to 
+; edit loop until it's time for the box to go away.
+;  
+DOMSGB  STX     TEMPX2
+        BSR     MSGBOX
+        LDX     #$E0A2
+        STX     CURSOR
+        LDX     TEMPX2
+        BSR     PUTMSG
+        JMP     MRKALL      ; Tail call to set dirty flag on screen.
+
+; PUTMSG: Writes a nul-terminated string to the screen at current screen cursor.
+; String pointer in X.
+;
+PUTMSG  LDA A   0, X
+        BEQ     PMSGDN
+        INX
+        STX     TEMPX
+        LDX     CURSOR
+        STA A   0, X
+        INX
+        STX     CURSOR
+        LDX     TEMPX
+        BRA     PUTMSG
+PMSGDN  RTS        
+
+; MSGBOX: Overdraws an empty dialog box window in the middle of the screen. 
+;
+MSGBOX  LDX     #$E060
+        LDA A   #'+
+        LDA B   #'-
+        BSR     DRWBLN
+        LDA A   #'I
+        LDA B   #' 
+        BSR     DRWBLN
+        BSR     DRWBLN
+        BSR     DRWBLN
+        LDA A   #'+
+        LDA B   #'-
+        BSR     DRWBLN
+        RTS
+
+; DRWBLN: Helper for drawing box lines, used above. 
+;
+DRWBLN  PSH A
+        PSH B
+        STA A   0, X
+        STA A   31, X
+        LDA A   #30
+DBLN1   INX
+        STA B   0, X
+        DEC A
+        BNE     DBLN1
+        INX                 ; Incremement to start of next line for convenience
+        INX
+        PUL B
+        PUL A
+        RTS
+
+;------------------------------------------------------------------------------
+;
 ; Cassette I/O.
 ;
 ;------------------------------------------------------------------------------
@@ -1244,7 +1382,12 @@ RCFIX2  STX     CSRDLN      ; And update the document cursor to match.
 ; These bits of code are basically cribbed from SYS2NF source.
 ;
 ;
-WRTDOC  JSR     DOCBYT      ; Calculate document size
+WRTDOC  LDX     #SSAVE
+        JSR     CONFRM
+        BNE     WRTDDN
+        LDX     #SSAVNG
+        JSR     DOMSGB      ; Put up the message box saying that we are saving.
+        JSR     DOCBYT      ; Calculate document size
         DEX                 ; Subtract one to meet the tape spec.
         STX     DOCSZE
 WRTBLK  CLR     NOPRNT      ; Suppress status showing onscreen.
@@ -1278,7 +1421,7 @@ CTIME2  DEX                 ; COUNTS CYCLES OF LOOP.
         JSR     CASOUT      ; BYTES.
         JSR     CASOUT      ; .
         JSR     TRNOFF      ; HALTS CASSETTE DRIVE.
-        RTS                 ; -
+WRTDDN  RTS                 ; -
 
 ; WRTDAT: Helper subroutine to write the document's data. This routine
 ; steps through each doument line until it runs out.
@@ -1312,9 +1455,11 @@ WRLNLP  LDA A   0, X
 ; RDDOC: Clear the current document and read in doc from cassette.
 ; 
 ;
-RDDOC   JSR     RSTDOC      ; Reset the document and memory allocator.
-        JSR     HOME        ; Cursor to top left
-        JSR     CLEAR       ; Clear the display
+RDDOC   LDX     #SLOAD
+        JSR     CONFRM
+        BNE     RDOCDN
+        JSR     RSTDOC      ; Reset the document and memory allocator.
+        JSR     HOMCLR      ; Cursor to top left, clear display
         LDA A   #'S         ; Set blockname to read ("S0")
         STA A   BLKNAM
         LDA A   #'0
@@ -1367,7 +1512,7 @@ READOK  LDX     DOCHED      ; Get ready
         STX     CSRDLN
         CLR     CSRDIX
         JSR     MRKALL      ; Flag the whole screen for re-render
-        RTS
+RDOCDN  RTS
 RDERR   JMP     ENTRY       ; Wipe out all the state on any error.
 
 ; DOCLNC: Compute count of lines in the active document (returned in X)
@@ -1536,12 +1681,18 @@ INCAB   INC B
         INC A
 IAB2    RTS
 
+; HOMCLR: PDS Home then clear
+;
+HOMCLR  JSR     HOME
+        JMP     CLEAR
+        
 ;
 ; Command jump table. Processed in order. 
 ;
 
-CMDCHR  FCB     $14,    $01,    $12,    $04,    $11,    $17,    $13,   $0D,   $0B,    $08,    $20,    $0B,    $16,    $19,   $10,    $0C
-CMDJMP  FDB     CSRLFT, CSRLFT, CSRRT,  CSRRT,  CSRUP,  CSRUP,  CSRDN, INSCR, KILLLN, GOBKSP, INSDEL, KILLLN, WRTDOC, RDDOC, PAGEUP, PAGEDN
+;               (lt)    Ctrl-A  (rt)    Ctrl-D  (up)    Ctrl-W  Ctrl-S (CR)   Ctrl-Y  (bksp)  (space) Ctrl-V  Ctrl-B Ctrl-P  Ctrl-L Ctrl-K  Ctrl-O              
+CMDCHR  FCB     $14,    $01,    $12,    $04,    $11,    $17,    $13,   $0D,   $19,    $08,    $20,    $16,    $02,   $10,    $0C,    $0B,   $0F   
+CMDJMP  FDB     CSRLFT, CSRLFT, CSRRT,  CSRRT,  CSRUP,  CSRUP,  CSRDN, INSCR, YANKLN, GOBKSP, INSDEL, WRTDOC, RDDOC, PAGEUP, PAGEDN, CSRHOM,CSREND
 
 ;
 ; Reflow buffer lives here.
@@ -1549,6 +1700,23 @@ CMDJMP  FDB     CSRLFT, CSRLFT, CSRRT,  CSRRT,  CSRUP,  CSRUP,  CSRDN, INSCR, KI
 
 RFLBUF  RMB     65          ; two full lines of reflow buffer 
 RFLEND  *                   ; this is the end of the reflow buffer 
+
+;
+; String table
+;
+
+STITLE  DS      "      S C R I P T O R"
+        FCB     0
+SAUTHR  DS      "     BY BEN ZOTTO 2023 "
+        FCB     0
+SSAVE   DS      "SAVE DOCUMENT TO TAPE?"
+        FCB     0
+SSAVNG  DS      "SAVING TO TAPE..."
+        FCB     0
+SLOAD   DS      "LOAD NEW DOCUMENT FROM TAPE?"
+        FCB     0
+SYESNO  DS      "CONFIRM (Y) OR CANCEL (ANY)"
+        FCB     0    
 
 END
     
