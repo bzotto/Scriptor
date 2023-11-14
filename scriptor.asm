@@ -118,6 +118,14 @@ RSCRLN  EQU     $8A         ; Render temp storage
 DRTLNS  EQU     $90         ; Dirty lines map [$90-$9F]
 EOFMEM  EQU     $A0         ; End of usable memory (determined at start)
 SCRDOC  EQU     $A2         ; Pointer to the first visible on-screen document line.
+RDPTR   EQU     $A4         ; Read pointer used by RDDOC and doc decode
+HUFPTR  EQU     $A6         ; Huffman tree "pointer" 
+HUFALV  EQU     $A7         ; Huffman machine "alive" flag (decode)
+HUFBUF  EQU     $A8         ; Single-byte buffer for encode
+HUFVLD  EQU     $A9         ; Count of valid bits in encode buffer
+HUFRDY  EQU     $AA         ; 16 bits of shiftable input to the encoder
+CHKSUM  EQU     $AC         ; Checksum temp storage for cassette routines
+HUFCNT  EQU     $AD         ; 16 bit count of document size temp storage.
 
 ;
 ; Actual program starts at $200, which is compatible with PDS memory map.
@@ -136,7 +144,7 @@ RESTRT  JSR     MRKALL      ; You can jump into the program here to recover curr
         BRA     MAIN_     
 ENTRY2  JSR     HOMCLR      ; Home & clear the screen
         JSR     SPLASH
-        JSR     HOMCLR
+ENTRY3  JSR     HOMCLR
         JSR     FNDEOM      ; Find and remember the end of useful memory.
         STX     EOFMEM         
         JSR     RSTDOC      ; Reset and create a new document
@@ -1309,6 +1317,17 @@ CONFRM  STX     TEMPX2
         CMP A   #'Y         ; Did the user confirm? Anything but "Y" is no/cancel/esc,
         RTS        
       
+; ALERT: Show "alert" box-- text pointer in X, waits for keypress to dismiss
+;
+ALERT   STX     TEMPX2
+        BSR     MSGBOX
+        LDX     #$E0A2
+        STX     CURSOR
+        LDX     TEMPX2
+        BSR     PUTMSG
+        JSR     GETCHR
+        JMP     MRKALL      ; Tail call to set dirty flag on screen.
+
 ; DOMSGB: Does a text message box. Pointer to text in X. This routine draws and 
 ; then marks the screen for re-render. The caller is not expected to return to 
 ; edit loop until it's time for the box to go away.
@@ -1387,10 +1406,12 @@ WRTDOC  LDX     #SSAVE
         BNE     WRTDDN
         LDX     #SSAVNG
         JSR     DOMSGB      ; Put up the message box saying that we are saving.
-        JSR     DOCBYT      ; Calculate document size
+        JSR     HUFINI      ; Reset the Huffman state machine
+        JSR     ENCSZE      ; Calculate encoded document size
         DEX                 ; Subtract one to meet the tape spec.
         STX     DOCSZE
-WRTBLK  CLR     NOPRNT      ; Suppress status showing onscreen.
+WRTBLK  CLR     CHKSUM      ; Clear the checksum
+        CLR     NOPRNT      ; Suppress status showing onscreen.
         JSR     TURNON      ; Turn on cassette.
         LDA B   #9          ; LOADS TIME LOOP COUNTER.
 CTIME1  LDX     #20833      ; MASTER TIME LOOP (1/4 SEC).
@@ -1398,7 +1419,7 @@ CTIME2  DEX                 ; COUNTS CYCLES OF LOOP.
         BNE     CTIME2      ; TESTS FOR FIRST TIME OUT.
         DEC B               ; COUNTS TIMES IN LOOP.
         BNE     CTIME1      ; SKIPS BACK UNTIL DONE. 
-        LDA A   #$16        ; PUTS SYNC CHARS ONTO TAPE. (B is now zero for chksum-- below this point nothing can mess with B-- stupid)
+        LDA A   #$16        ; PUTS SYNC CHARS ONTO TAPE. 
         JSR     CASOUT      ; .
         JSR     CASOUT      ; .
         JSR     CASOUT      ; .
@@ -1415,7 +1436,7 @@ CTIME2  DEX                 ; COUNTS CYCLES OF LOOP.
         BSR     WRTDAT      ; Call the routine that emits the actual document data.
         LDA A   #$17        ; OUTPUTS END-OF-BLOCK CHAR.
         JSR     CASOUT      ; ETB IS DISPLAYED AS A "W".
-        TBA                 ; A GETS CHECKSUM FROM B.
+        LDA A   CHKSUM      ; Load the final checksum
         JSR     CASOUT      ; OUTPUTS THE CHECKSUM.
         JSR     CASOUT      ; OUTPUTS THE TRAILER FILLER
         JSR     CASOUT      ; BYTES.
@@ -1424,7 +1445,7 @@ CTIME2  DEX                 ; COUNTS CYCLES OF LOOP.
 WRTDDN  RTS                 ; -
 
 ; WRTDAT: Helper subroutine to write the document's data. This routine
-; steps through each doument line until it runs out.
+; steps through each document line until it runs out.
 ; 
 WRTDAT  LDX     DOCHED      ; Load up the first line of the document
 WRDAT1  BEQ     WRDTDN      ; is the current line ptr NULL?
@@ -1433,25 +1454,30 @@ WRDAT1  BEQ     WRDTDN      ; is the current line ptr NULL?
         LDX     WRTMP1
         LDX     0, X        ; line = line->next
         BRA     WRDAT1
-WRDTDN  RTS     
+WRDTDN  LDA A   #$04        ; EOT character indicating end of file
+        JSR     HUFENC      ; Write an EOT
+        JSR     HFFLSH      ; Flush the encoder 
+        RTS     
 
-; WRTLIN: Helper routine to emit a single line of text via the cassette
+; WRTLIN: Helper routine to write a single line of text via the cassette
 ; output. Input is X, pointing to a line node.
 ;
 WRTLIN  JSR     LNTEXT      ; Get the contents start
-        LDA A   #SCRN_W     ; Set write count to 32
+        LDA A   #SCRN_W     ; Set max write count to 32
         STA A   WRCNT
 WRLNLP  LDA A   0, X        
+        CMP A   #BLNKCH     ; If this is a blank, then stop encoding the line.
+        BEQ     WRLNLF     
         STX     WRTMP2
-        JSR     CASOUT
-        ABA                 ; Update checksum A = B + A
-        TAB                 ;                 B = A
+        JSR     HUFENC      ; Submit this byte to the Huffman encoder
         LDX     WRTMP2
         INX
         DEC     WRCNT
-        BNE     WRLNLP
+        BNE     WRLNLP        
+WRLNLF  LDA A   #$0A        ; Write a linefeed to indicate end of line.
+        JSR     HUFENC      ; Submit this byte to the Huffman encoder
         RTS
-
+        
 ; RDDOC: Clear the current document and read in doc from cassette.
 ; 
 ;
@@ -1460,6 +1486,7 @@ RDDOC   LDX     #SLOAD
         BNE     RDOCDN
         JSR     RSTDOC      ; Reset the document and memory allocator.
         JSR     HOMCLR      ; Cursor to top left, clear display
+        CLR     CHKSUM      ; Reset checksum
         LDA A   #'S         ; Set blockname to read ("S0")
         STA A   BLKNAM
         LDA A   #'0
@@ -1471,41 +1498,28 @@ RDDOC   LDX     #SLOAD
                             ; take advantange of RDHDR doing the math for us so it's safe)
         JSR     TURNON      ; TURNS ON TAPE DRIVE.
         JSR     RDHDR       ; READS IN THE HEADER.
-        CLR B               ; INIT B FOR CHECKSUM.
-        LDX     DOCHED
-RBFR1   STX     LLTNEW      ; .
-        CLR A               ; Clear count for this line
+        JSR     HUFINI      ; Reset the huffman machine.
+        LDX     DOCHED      ; Setup the starting read destination
         JSR     LNTEXT      ; Move pointer to the content area
-RBFR2   PSH A
-        STX     TEMPX2
-        JSR     CASIN       ; A GETS CHAR READ IN.
-        LDX     TEMPX2      ; X GETS BUFFER PTR.
-        STAA    0,X         ; STORS CHAR INTO BUFFER.
-        ABA                 ; A GETS A+B.
-        TAB                 ; B GETS A.
-        INX                 ; INC TO NEXT CHAR POSITIN.
-        STX     LLTNEW
+        STX     RDPTR       ; This is our initial read pointer.
+RDNEXT  JSR     CASIN       ; A gets the character read in.
+        PSH A
+        JSR     HUFDEC      ; Send this byte to the decoder machine.
         PUL A
-        INC A
-        CMP A   #SCRN_W
-        BNE     RBFR2       ; GOES BACK IF ANY LEFT.
-        ; Prep for the next line. 
-        PSH B
-        LDA A   BFRSZE      ; Decrement bytes remaining by 32.
+        ADD A   CHKSUM
+        STA A   CHKSUM
+        LDA A   BFRSZE      ; Decrement remaining byte count.
         LDA B   BFRSZE+1
-        SUB B   #SCRN_W
+        SUB B   #1
         SBC A   #0
         STA A   BFRSZE
         STA B   BFRSZE+1
-        PUL B
-        LDX     BFRSZE
-        BEQ     RDTRLR      ; if we read all the lines, then move on to the trailer
-        LDX     #0          
-        JSR     INSL        ; Insert a new line at the tail of the document.
-        BRA     RBFR1
-RDTRLR  JSR     RDTLR
+        LDX     BFRSZE      ; Load the remaining bytes to check if we're done?
+        BNE     RDNEXT
+RDTRLR  LDA B   CHKSUM
+        JSR     RDTLR
         JSR     CLEAR       ; Get rid of loading indications onscreen
-        TST     CSTATS      ; How did it go?
+        LDA A   CSTATS      ; How did it go?
         BNE     RDERR
 READOK  LDX     DOCHED      ; Get ready 
         STX     SCRDOC      ; Cursor to start of document.
@@ -1513,34 +1527,199 @@ READOK  LDX     DOCHED      ; Get ready
         CLR     CSRDIX
         JSR     MRKALL      ; Flag the whole screen for re-render
 RDOCDN  RTS
-RDERR   JMP     ENTRY       ; Wipe out all the state on any error.
-
-; DOCLNC: Compute count of lines in the active document (returned in X)
-;
-DOCLNC  LDX     DOCHED
-        CLR A
-        CLR B
-DOCLC1  JSR     INCAB
-        LDX     0, X        ; line = line->next
-        BNE     DOCLC1
-        JMP     TABX        ; [TC] X = AB
+RDERR   LDX     #SLERR
+        STA A   15, X       ; Patch the string to include the error char
+        JSR     ALERT       ; Show alert box.
+        JMP     ENTRY3      ; Wipe out all the state on any error.
         
-; DOCBYT: Count of bytes in the active document. 
+; ENCSZE: Count of bytes for a Huffman encoding of this document. It is very
+; annoying to have to compute this up front, but if we want to fit into the 
+; standard Sphere block format (why do we??) then we need to be able to come up
+; with this.
 ;
-DOCBYT  BSR     DOCLNC      ; Count the lines in the document
-        JSR     TXAB
-        ASL B               ; Multiply line count by line length (32)
-        ROL A
-        ASL B
-        ROL A
-        ASL B
-        ROL A
-        ASL B
-        ROL A
-        ASL B
-        ROL A
-        JSR     TABX
+ENCSZE  LDX     #0          ; Clear out the byte count
+        STX     HUFCNT      
+        CLR B               ; Use B as a bit count 
+        LDX     DOCHED      ; Start at the top of the document
+HSZE1   STX     LLTNEW      ; Stash this as the current line start
+        JSR     LNTEXT      ; Advance to text
+        STX     TEMPX2      ; Compute the hard EOL 
+        JSR     ADDLN
+        STX     CPYEND      ; Save that
+        LDX     TEMPX2      ; Get back the text pointer.
+HSZELP  LDA A   0, X
+        CMP A   #BLNKCH
+        BEQ     HSNXTL
+        BSR     HFSZCH      ; Process this character
+HSZE3   INX
+        CPX     CPYEND      ; Did we run off without hitting a blank?
+        BNE     HSZELP      ; Go back for next char
+HSNXTL  LDA A   #$0A        ; LF at end of line.
+        BSR     HFSZCH
+        LDX     LLTNEW      ; Get back the line pointer
+        LDX     0, X        ; line = line->next
+        BNE     HSZE1         
+        LDA A   #$04        ; No more document. "Emit" an EOT.
+        BSR     HFSZCH              
+        LDX     HUFCNT      ; Load the final byte count
+        TST     B           ; Were there any leftover bits to "emit"
+        BEQ     HSDONE      ; No? this count is correct
+        INX                 ; If so, bump for that final byte.
+HSDONE  RTS
+        
+        
+; HFSZCH: Helper routine only for the above that processes a single byte value.
+; Byte val in A, running bit count must be in B, this routine doesn't mess with
+; X.
+;
+HFSZCH  ASL A               ; Table index of entry
+        INC A               ; But we want the second byte of it only
+        STA A   HSZE2+1     ; SMC
+        STX     TEMPX
+        LDX     #ENCTBL
+HSZE2   LDA A   0, X        ; SMC
+        LDX     TEMPX       ; get back the ch index
+        AND A   #$0F        ; get the bit count in A.
+        ABA                 ; B += A
+        TAB     
+HSZCHK  CMP B   #8          ; Is B < 8? 
+        BCS     HSZE4       ; If less than, skip the byte inc stuff.    
+        INC     HUFCNT+1    ; Increment the low byte
+        BNE     HSZCHX      ; If we didn't roll over, done
+        INC     HUFCNT      ; If we carried increment the high byte
+HSZCHX  SUB B   #8          ; Subtract that 1 byte = 8 bits from the bit count.
+        BRA     HSZCHK      ; Go back and check again to see if it's still > 8
+HSZE4   RTS
+        
+; RDEMIT: *Emit* a new decoded character while decoding a document. Character is 
+; in A. This routine needs to know what to do with it and how to update the 
+; loading state accordingly. Newly inserted lines in the document are prefilled
+; with blanks. The encoded data stream does not store the blanks, but does use
+; the LF character (0A) to signal end of wrapped line. These lines are pre-wrapped,
+; so we should never get more than 32 chars without a CR or an LF.
+;
+RDEMIT  CMP A   #$0A        ; Is this a linefeed? That means this line is done.
+        BEQ     RDENXL      
+        CMP A   #$04        ; EOT is end of file. Don't process bits after this.
+        BNE     RDEMT1
+        CLR     HUFALV      ; Huff machine no longer alive!
         RTS
+RDEMT1  LDX     RDPTR       ; Load back the read pointer
+        STA A   0, X        ; Write the character
+        INX                 ; Update the ptr
+        BRA     RDMTDN          
+RDENXL  LDX     #0          ; Line is done.
+        JSR     INSL        ; Insert a new line at the tail of the document.
+        JSR     LNTEXT      ; Save pointer to the next char to write.
+RDMTDN  STX     RDPTR
+        RTS        
+        
+        
+; WREMIT: *Emit* a freshly encoded byte while writing a document. Byte to write is in
+; A. 
+;
+WREMIT  JSR     CASOUT
+        ADD A   CHKSUM      ; A <- A + checksum
+        STA A   CHKSUM      ; Checksum <- A
+        RTS
+
+;------------------------------------------------------------------------------
+;
+; Huffman encode and decode
+;
+;------------------------------------------------------------------------------
+
+HUFINI  LDA A   #1
+        STA A   HUFALV      ; Unclear the alive flag.
+        CLR A
+        STA A   HUFPTR      ; Clear the decode tree pointer
+        STA A   HUFBUF      ; Clear the encode buffer (not required, nice for debug)
+        STA A   HUFVLD      ; Clear the valid bit count for the encode buffer.
+        RTS        
+
+; HUFDEC: Submit one encoded byte to the Huffman decoder. This routine will call out to 
+; the RDEMIT routine when it needs to disgorge a decoded byte.
+; Doesn't preserve any registers. It stores state between invocations with the HUFPTR
+; pointer into the decoder tree. 
+;
+HUFDEC  LDA B   #8          ; process 8 bits.
+HUFDC1  TST     HUFALV      ; is the decoder alive? (this is toggled by the emit routine)
+        BEQ     HDECDN      ; if decoder is not alive, swallow the rest of the input.
+        ASL A               ; Shift out the next bit.   
+        PSH A               ; save both the remaining bits count and the bit block
+        PSH B
+        BCC     HDECLT      ; If carry is clear, we are looking left immediately.
+        INC     HUFPTR      ; Increment the pointer, since we're looking at the "right" half.
+HDECLT  LDA A   HUFPTR      ; Load the pointer value
+        STA A   HDCLT1+1    ; [SMC] Patch the value load below.
+        LDX     #DECTRE
+HDCLT1  LDA A   0, X        ; [SMC] load the selected byte.
+        BMI     HDECEM      ; High bit set means we have to emit.
+        
+HDCTRV  ASL A               ; *= 2 to get "actual" table offset.
+        STA A   HUFPTR      ; Update the tree pointer.
+        BRA     HDCBOT
+
+HDECEM  ; The value in A is a final byte value.
+        AND A   #$7F        ; strip off the high bit
+        BSR     RDEMIT      ; emit the byte.
+        CLR     HUFPTR      ; reset the pointer
+        
+        ; Fall through into "bottom" of the loop. 
+HDCBOT  PUL B               ; Restore the huffman input
+        PUL A
+        DEC B               ; Subtract the bit we just processed
+        BNE     HUFDC1      ; Are there more to process?
+HDECDN  RTS                 ; Done with 8 bits.
+
+
+; HUFENC: Submit one plaintext byte to the Huffman encoder. This routine will call out
+; to the WREMIT routine when it needs to disgorge a processed (encoded) byte.
+;
+HUFENC  ASL A               ; turn the character into a table index
+        STA A   HFENC1+1    ; [SMC] Patch the pointer load below
+        LDX     #ENCTBL
+HFENC1  LDX     0, X        ; [SMC] X = value of the table entry byte pair
+        STX     HUFRDY       
+        LDA A   HUFRDY       
+        LDA B   HUFRDY+1
+        AND B   #$0F
+        BEQ     HECSKP      ; If the table has no bits for this input (error!), skip it.
+HFENC2  ASL     HUFRDY+1    ; Shift one bit all the way through
+        ROL     HUFRDY
+        ROL     HUFBUF
+        INC     HUFVLD      ; Increment the valid bits in the buffer 
+        LDA A   HUFVLD
+        CMP A   #8          ; Did we fill the buffer?
+        BNE     HENBOT      ; Did we just shift in the 8th bit to the output buffer?
+    
+HFENEM  LDA A   HUFBUF      ; If we shifted last bit in, emit the byte
+        PSH B
+        BSR     WREMIT      ; Emit a byte.
+        PUL B
+        CLR     HUFVLD      ; Reset the valid bit count
+        CLR     HUFBUF      ; We don't *really* need to do this but for debugging it's nice.
+        ; Fall through to bottom of the loop      
+        
+HENBOT  DEC B               ; Decrememt the number of remaining bits in the input
+        BNE     HFENC2      ; If we didn't run out of bits, do it again
+        ; We ran out of bits! Leave the state machine where it is.
+HECSKP  RTS
+        
+; HFFLSH: Flush the Huffman encoder. If there are valid bits in the buffer,
+; pad them out with zero from the right and ship it.
+; 
+HFFLSH  LDA B   HUFVLD
+        BEQ     HFLSH2
+        LDA A   HUFBUF
+HFLSH1  ASL A
+        INC B
+        CMP B   #8
+        BNE     HFLSH1
+        JSR     WREMIT      ; Emit that final byte
+        CLR     HUFVLD
+        CLR     HUFBUF
+HFLSH2  RTS        
 
 ;------------------------------------------------------------------------------
 ;
@@ -1717,6 +1896,75 @@ SLOAD   DS      "LOAD NEW DOCUMENT FROM TAPE?"
         FCB     0
 SYESNO  DS      "CONFIRM (Y) OR CANCEL (ANY)"
         FCB     0    
+SLERR   DS      "ERROR LOADING ( ) "     ; Patch index 15 in this string with an error code.
+        FCB     0
+
+;------------------------------------------------------------------------------
+;
+; Huffman encode/decode tables.
+;
+; This program uses a fixed Huffman encoding for all saving and loading, 
+; represented below. It was computed from a corpus of sample text, and 
+; includes the ASCII range of 0x20-5F (uppercase, digits, punctuation) plus
+; select high symbols and a few important nonprinting control characters.
+;
+;------------------------------------------------------------------------------
+
+; Encoding table. This is a table of 128, 16-bit entries. These represent one entry (2 bytes)
+; for ASCII values 0-127. You simply take the character value to encode, multiply by two, and
+; use that as your index off of the ENCTBL base. The format of the entry itself is: up to 12
+; bits of prefix code for this entry, starting at the top of the first byte and running through
+; the middle of the second byte. The last four bits (low nibble of second byte) is a count
+; of the valid bits (1-12). If the count is zero, then there is no encoding for this character.
+; (This should not happen.) All unused bits within each entry's bit set are set to zero.
+
+ENCTBL  FCB    $00, $00, $00, $00, $00, $00, $00, $00, $28, $0C, $00, $00, $00, $00, $00, $00
+        FCB    $00, $00, $28, $1C, $08, $05, $00, $00, $00, $00, $EC, $07, $00, $00, $00, $00
+        FCB    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
+        FCB    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
+        FCB    $A0, $03, $82, $5C, $EF, $89, $28, $2C, $28, $3C, $28, $4C, $28, $5C, $EE, $09
+        FCB    $29, $CB, $29, $EB, $28, $6C, $28, $7C, $80, $07, $D7, $08, $D4, $07, $28, $8C
+        FCB    $EF, $09, $83, $08, $D6, $09, $82, $CA, $EE, $8B, $29, $8A, $29, $4A, $26, $89
+        FCB    $D6, $89, $27, $08, $82, $6B, $EE, $BC, $28, $9C, $28, $AC, $28, $BC, $EE, $AC
+        FCB    $28, $CC, $90, $04, $E8, $06, $60, $05, $88, $05, $F0, $04, $84, $06, $D0, $06
+        FCB    $E0, $05, $40, $04, $26, $09, $24, $07, $D8, $05, $6C, $06, $50, $04, $70, $04
+        FCB    $68, $06, $82, $8A, $10, $04, $30, $04, $C0, $04, $00, $05, $2A, $07, $2C, $06
+        FCB    $EE, $CA, $20, $06, $82, $0A, $28, $DC, $28, $EC, $28, $FC, $29, $0C, $29, $1C
+        FCB    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
+        FCB    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
+        FCB    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
+        FCB    $00, $00, $00, $00, $00, $00, $29, $2C, $00, $00, $29, $3C, $82, $4C, $00, $00
+
+; Decoding "tree" structure. Each node of the tree is a two byte pair, a "left" value/pointer
+; and a "right" value/pointer. The root of the tree is at the start. For each half of a node,
+; its meaning depends on its high bit. If the high bit is set, you've found a "leaf" which
+; contains an ASCII character to emit (contained in the remaining 7 bits). If the high bit
+; is clear, the value is a "pointer" to the (left or right) child node. To recover the 
+; actual pointer, take the 7 bit value, shift it left once (*= 2), and add to DECTRE. That
+; will point to the byte pair of the child node.
+;
+; Note that this tree structure can always be represented in max 256 bytes for any possible
+; tree shape for 7-bit ASCII (including degenerate superlong codes). But since this 
+; implementation limits both the set of valid encodable characters as well as the bit depth
+; of the codes, this decoding tree requires much less than the full size. The rest of it
+; is not meaningful and is commented out below but retained to indicate the maxmium tree size.
+
+DECTRE  FCB    $01, $29, $02, $24, $03, $05, $04, $D2, $D5, $8A, $06, $D3, $07, $0B, $D9, $08
+        FCB    $CB, $09, $0A, $B9, $CA, $B7, $0C, $D7, $0D, $D6, $0E, $1D, $0F, $16, $10, $13
+        FCB    $11, $12, $84, $89, $A3, $A4, $14, $15, $A5, $A6, $AA, $AB, $17, $1A, $18, $19
+        FCB    $AF, $BC, $BD, $BE, $1B, $1C, $C0, $DB, $DC, $DD, $1E, $22, $1F, $B6, $20, $21
+        FCB    $DE, $DF, $FB, $FD, $B5, $23, $A8, $A9, $25, $26, $C9, $CE, $27, $CF, $C3, $28
+        FCB    $D0, $CD, $2A, $35, $2B, $A0, $2C, $C1, $2D, $C4, $2E, $C6, $AC, $2F, $30, $B1
+        FCB    $31, $34, $DA, $32, $33, $BA, $FE, $A1, $D1, $B3, $36, $3C, $D4, $37, $38, $CC
+        FCB    $C7, $39, $AE, $3A, $3B, $AD, $B2, $B8, $3D, $C5, $C8, $3E, $C2, $3F, $8D, $40
+        FCB    $41, $45, $A7, $42, $43, $D8, $B4, $44, $BF, $BB, $B0, $A2, $00, $00, $00, $00
+;       FCB    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
+;       FCB    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
+;       FCB    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
+;       FCB    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
+;       FCB    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
+;       FCB    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
+;       FCB    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
 
 END
     
