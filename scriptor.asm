@@ -70,6 +70,8 @@ BLNKCH  EQU     $60         ; $60 represents a special "blank" character-- used 
 REALCR  EQU     $0D         ; Actual CR character, allowed in the offscreen document only
 NODESZ  EQU     $24         ; Size of each raw linked list entry = SCRN_W + 4
 
+PIAB    EQU     $F042       ; Base address of port B of onboard PIA
+
 ;
 ; Program variables. These are all located in the direct page, safely above 
 ; the PDS state management area. They are not in a especially meaningful order
@@ -1723,6 +1725,87 @@ HFLSH2  RTS
 
 ;------------------------------------------------------------------------------
 ;
+; PR-40 Printer output
+;
+;------------------------------------------------------------------------------
+
+; PRTDOC: Initializes the PR-40 printer and prints the entire document to it.
+;   Confirms first. This will probably hang if the printer is not present, or
+;   misconfigured, or whatever. I should add a watchdog fail timer to the output
+;   loop.
+;
+PRTDOC  LDX     #SPRINT     ; Confirm that the user wants to do this.
+        JSR     CONFRM
+        BNE     PRTEX
+        LDX     #SPRNTG     ; "PRINTING..."
+        JSR     DOMSGB
+        
+        ; Initialize the PR-40 PIA. We DON'T assume that it's in the reset state,
+        ; so setup the data direction register.
+        
+        LDX     #PIAB
+        LDA A   #$3A        ; Access the data direction register
+        STA A   1, X
+        LDA A   #$FF        ; All bits to outputs
+        STA A   0, X
+        LDA A   #$3E        ; Back to data register with CB2 high
+        STA A   1, X        
+        
+        ; Ready to print. Output a carriage return first to get the
+        ; carriage back to a known state.
+        LDA A   #$0D
+        BSR     PRTCHR
+        
+        ; Print the document contents. No final CR needed because the line print
+        ; routine will always conclude with a CR.
+        BSR     PRTDAT      
+PRTEX   RTS
+
+; PRTCHR: Outputs the char in A to the PR-40 printer via PIA port B.
+;   Toggles the data strobe and waits for the data accepted to assert.
+;
+PRTCHR  STA A   PIAB        ; Character to data register
+        LDA A   #$36        ; data ready strobe low
+        STA A   PIAB+1
+        LDA A   #$3E        ; data ready strobe high
+        STA A   PIAB+1
+PCHRLP  TST     PIAB+1      ; test for asserted data accepted
+        BPL     PCHRLP      ; loop until ready
+        LDA A   PIAB        ; clear the interrupt state
+        RTS
+
+; PRTDAT: Helper subroutine to print the document's data. This routine
+; steps through each document line until it runs out.
+; 
+PRTDAT  LDX     DOCHED      ; Load up the first line of the document
+PTDAT1  BEQ     PTDTDN      ; is the current line ptr NULL?
+        STX     WRTMP1
+        BSR     PRTLIN      ; Call the line printer helper.
+        LDX     WRTMP1
+        LDX     0, X        ; line = line->next
+        BRA     PTDAT1
+PTDTDN  RTS     
+
+; PRTLIN: Helper routine to print a single line of text.
+;    Input is X, pointing to a line node.
+;
+PRTLIN  JSR     LNTEXT      ; Get the contents start
+        LDA A   #SCRN_W     ; Set max write count to 32
+        STA A   WRCNT
+PTLNLP  LDA A   0, X        
+        CMP A   #BLNKCH     ; If this is a blank, then stop printing the line.
+        BEQ     PTLNLF     
+        CMP A   #REALCR     ; If we encounter a "real" CR, just do that below.
+        BEQ     PTLNLF
+        BSR     PRTCHR      ; Submit the character to the printer        
+        INX
+        DEC     WRCNT
+        BNE     PTLNLP        
+PTLNLF  LDA A   #$0D
+        BRA     PRTCHR      ; Submit a CR to the printer (tail call)
+
+;------------------------------------------------------------------------------
+;
 ; Semantically specific utility routines
 ;
 ;------------------------------------------------------------------------------
@@ -1869,9 +1952,9 @@ HOMCLR  JSR     HOME
 ; Command jump table. Processed in order. 
 ;
 
-;               (lt)    Ctrl-A  (rt)    Ctrl-D  (up)    Ctrl-W  Ctrl-S (CR)   Ctrl-Y  (bksp)  (space) Ctrl-V  Ctrl-B Ctrl-P  Ctrl-L Ctrl-K  Ctrl-O              
-CMDCHR  FCB     $14,    $01,    $12,    $04,    $11,    $17,    $13,   $0D,   $19,    $08,    $20,    $16,    $02,   $10,    $0C,    $0B,   $0F   
-CMDJMP  FDB     CSRLFT, CSRLFT, CSRRT,  CSRRT,  CSRUP,  CSRUP,  CSRDN, INSCR, YANKLN, GOBKSP, INSDEL, WRTDOC, RDDOC, PAGEUP, PAGEDN, CSRHOM,CSREND
+;               (lt)    Ctrl-A  (rt)    Ctrl-D  (up)    Ctrl-W  Ctrl-S (CR)   Ctrl-Y  (bksp)  (space) Ctrl-V  Ctrl-B Ctrl-P  Ctrl-L Ctrl-K  Ctrl-O  Ctrl-U              
+CMDCHR  FCB     $14,    $01,    $12,    $04,    $11,    $17,    $13,   $0D,   $19,    $08,    $20,    $16,    $02,   $10,    $0C,    $0B,   $0F,    $15
+CMDJMP  FDB     CSRLFT, CSRLFT, CSRRT,  CSRRT,  CSRUP,  CSRUP,  CSRDN, INSCR, YANKLN, GOBKSP, INSDEL, WRTDOC, RDDOC, PAGEUP, PAGEDN, CSRHOM,CSREND, PRTDOC
 
 ;
 ; Reflow buffer lives here.
@@ -1897,6 +1980,10 @@ SLOAD   DS      "LOAD NEW DOCUMENT FROM TAPE?"
 SYESNO  DS      "CONFIRM (Y) OR CANCEL (ANY)"
         FCB     0    
 SLERR   DS      "ERROR LOADING ( ) "     ; Patch index 15 in this string with an error code.
+        FCB     0
+SPRINT  DS      "PRINT DOC TO PR-40?"
+        FCB     0
+SPRNTG  DS      "PRINTING..."
         FCB     0
 
 ;------------------------------------------------------------------------------
