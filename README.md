@@ -28,7 +28,7 @@ I'm sorry this is not in a super convenient format, again, I guess I don't reall
 
 Once you've assembled the file, you have a raw program binary. You can turn this into a cassette image using the [bin2sphere](https://github.com/bzotto/bin2sphere) tool. From there the `.cassette` image file can be turned into a Kansas City standard format `wav` file for use on real hardware, or can be loaded directly into my [Sphere web emulator](https://sphere.computer/emulator). 
 
-The cold start entry point is at `$200`. There is a "warm start" entry at `$205` that does not reset the document area, so if you end up doing a system reset you have a chance at rescuing the document. 
+The cold start entry point is at `$200`. There is a "warm start" entry at `$205` that does not reset the document area, so if you end up doing a system reset you have a chance at rescuing the document if you come back via `$205`.
 
 ## Using Scriptor
 
@@ -36,16 +36,19 @@ It's largely self explanatory. Program starts with an empty document which you t
 
 Control-Y yanks (aka kills) the current cursor line.
 
-Use Control-V to save the current document to cassette and Control-B to load a document from cassette. Both of these will take a long time for nontrivial documents. (Sorry, I haven't implemented prefix coding compression yet.)
+Use Control-V to save the current document to cassette and Control-B to load a document from cassette. Both of these will take a long time for nontrivial documents, but the data is compressed to about half the raw text size, so that's something.
+
+Use Control-U to send hard copy output to a SWTPC PR-40 printer attached to port B of the onboard PIA.
 
 ## What you need for real hardware
 
 Got a Sphere system and want to write the great American short story? Great! The default program assumes a hardware configuration that includes: 
 
-- CRT/1 video board (32x16 lines of text) at $E000 (the default).
 - PDS-V3N firmware (or compatible; the PDS-V3D? should work too if you have the KBD/1 keyboard connected).
+- CRT/1 video board (32x16 lines of text) at $E000 (the default) 
 - At least 8K RAM (i.e. a MEM/1 or MEM/6 board installed).
 - SIM/1 for cassette with SYS2NF cassette firmware.
+- Optional: SWTPC PR-40 or similar parallel printer for hard copy output
 
 ## Implementation notes
 
@@ -56,6 +59,8 @@ The live word wrap happens during editing. There is a separate "reflow" buffer a
 Cassette I/O routines are deconstructed from the standard SNS2NF read/write block, since the document is neither created nor retrieved as a single flat buffer with explicit size. Instead we do a bunch of work to write from the document data and read into document data. 
 
 To keep document save and load to tape as fast as possible, the program compresses the output using a Huffman-style prefix encoding with a fixed symbol dictionary and tree. This tends to get 50% or better savings in terms of byte count (which directly translates into minutes you are waiting for the cassette recorder).
+
+Printer routine sends to a SWTPC PR-40 printer at `$F042` (port B of onboard PIA). Any parallel printer using similar interface semantics via a PIA can be easily supported with only minor changes. (Something with 80 columns would surely be more useful for longer documents.)
 
 ## For more information
 
