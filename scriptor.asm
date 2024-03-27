@@ -71,6 +71,7 @@ REALCR  EQU     $0D         ; Actual CR character, allowed in the offscreen docu
 NODESZ  EQU     $24         ; Size of each raw linked list entry = SCRN_W + 4
 
 PIAB    EQU     $F042       ; Base address of port B of onboard PIA
+PR40_W  EQU     39          ; Line width of PR-40 printer
 
 ;
 ; Program variables. These are all located in the direct page, safely above 
@@ -128,6 +129,7 @@ HUFVLD  EQU     $A9         ; Count of valid bits in encode buffer
 HUFRDY  EQU     $AA         ; 16 bits of shiftable input to the encoder
 CHKSUM  EQU     $AC         ; Checksum temp storage for cassette routines
 HUFCNT  EQU     $AD         ; 16 bit count of document size temp storage.
+WRCNT2  EQU     $AF         ; I/O temp count 2
 
 ;
 ; Actual program starts at $200, which is compatible with PDS memory map.
@@ -1725,7 +1727,8 @@ HFLSH2  RTS
 
 ;------------------------------------------------------------------------------
 ;
-; PR-40 Printer output
+; PR-40 Printer output. 
+; Assumes printer connected to port B of the CPU board's PIA. 
 ;
 ;------------------------------------------------------------------------------
 
@@ -1750,15 +1753,18 @@ PRTDOC  LDX     #SPRINT     ; Confirm that the user wants to do this.
         STA A   0, X
         LDA A   #$3E        ; Back to data register with CB2 high
         STA A   1, X        
+        LDA A   0, X        ; Clear any pending interrupt state.
         
         ; Ready to print. Output a carriage return first to get the
         ; carriage back to a known state.
         LDA A   #$0D
         BSR     PRTCHR
         
-        ; Print the document contents. No final CR needed because the line print
-        ; routine will always conclude with a CR.
+        ; Print the document contents and a final CR.
         BSR     PRTDAT      
+        LDA A   #$0D
+        BSR     PRTCHR
+        
 PRTEX   RTS
 
 ; PRTCHR: Outputs the char in A to the PR-40 printer via PIA port B.
@@ -1777,7 +1783,10 @@ PCHRLP  TST     PIAB+1      ; test for asserted data accepted
 ; PRTDAT: Helper subroutine to print the document's data. This routine
 ; steps through each document line until it runs out.
 ; 
-PRTDAT  LDX     DOCHED      ; Load up the first line of the document
+PRTDAT  LDA A   #PR40_W     ; Set the remaining line write count to 39.
+                            ; (avoid ever triggering the printer's auto-CRLF)
+        STA A   WRCNT
+        LDX     DOCHED      ; Load up the first line of the document
 PTDAT1  BEQ     PTDTDN      ; is the current line ptr NULL?
         STX     WRTMP1
         BSR     PRTLIN      ; Call the line printer helper.
@@ -1786,23 +1795,69 @@ PTDAT1  BEQ     PTDTDN      ; is the current line ptr NULL?
         BRA     PTDAT1
 PTDTDN  RTS     
 
-; PRTLIN: Helper routine to print a single line of text.
-;    Input is X, pointing to a line node.
+; PRTLIN: Helper subroutine to print a line of document data. 
 ;
-PRTLIN  JSR     LNTEXT      ; Get the contents start
-        LDA A   #SCRN_W     ; Set max write count to 32
+;   count next token length (will be 0 if already EOL, at least 1 otherwise)
+;   is 0? return from this routine
+;   if this less than WRCNT?
+;       no-> first emit a CR and reset WRCNT
+;   emit this token.
+;   loop      
+; 
+PRTLIN  JSR     LNTEXT      ; Get the content start
+        LDA A   #SCRN_W
+        STA A   WRCNT2      ; This holds the max remaining bytes in the source line
+PTLNGO  STX     WRTMP2
+        BSR     PTOKMS      ; Measure the next token (returns in B)
+        TST B   
+        BEQ     PTLNDN      ; If it was zero, done with this line.
+        CMP B   WRCNT
+        BLS     PTLNPT      ; if token length is <= remaining char count, go print it
+        BSR     PRCRRS
+PTLNPT  LDX     WRTMP2      
+PTLNP2  LDA A   0, X        ; Get the character
+        INX                 ; Increment the source pointer
+        CMP A   #$0D        ; Is the *source* character a CR?
+        BNE     PTLNP3      ; no, it's normal, keep going
+        BSR     PRCRRS      ; ok, do the CR and reset. 
+        BRA     PTLNGO      ; go back to the top, we've already incremented the source ptr 
+PTLNP3  BSR     PRTCHR
+        DEC     WRCNT       ; Decrement remaining chars in this printer line
+        DEC B               ; Decrement remaining chars in this token
+        BEQ     PTLNGO      ; if there are no more characters in this token, do next one
+        BRA     PTLNP2      ; keep printing this token.
+PTLNDN  RTS                 ; we jump here on zero length token which is EOL.
+
+; PRCRRS: Print a CR and reset the line count
+PRCRRS  LDA A   #$0D        ; Emit a CR
+        BSR     PRTCHR
+        LDA A   #PR40_W     ; Reset count in print line
         STA A   WRCNT
-PTLNLP  LDA A   0, X        
-        CMP A   #BLNKCH     ; If this is a blank, then stop printing the line.
-        BEQ     PTLNLF     
-        CMP A   #REALCR     ; If we encounter a "real" CR, just do that below.
-        BEQ     PTLNLF
-        BSR     PRTCHR      ; Submit the character to the printer        
-        INX
-        DEC     WRCNT
-        BNE     PTLNLP        
-PTLNLF  LDA A   #$0D
-        BRA     PRTCHR      ; Submit a CR to the printer (tail call)
+        RTS
+
+; PTOKMS: Token measure. X points to start of token. Length of token
+;   returns in B, X and A are clobbered.
+;
+; A token is 0-length (nothing) if pointer already at EOL. Otherwise a token
+; begins at the pointer and ends with either a space or a hard CR. The
+; "typical" case is a word followed by a space, but a word followed by hard CR,
+; or a space or a CR by itself, are also valid length-1 tokens.
+;
+PTOKMS  CLR B
+PTMKS1  TST     WRCNT2      ; Did we run off the end of the input? Then we're done.
+        BEQ     PTMKSDN     
+        LDA A   0, X
+        CMP A   #BLNKCH     ; Did we run off the end of the input?
+        BEQ     PTMKSDN
+        INC B               ; Whatever it is, counts.
+        DEC     WRCNT2      ; Decrement remaining possible chars in this line. We never backtrack.
+        CMP A   #'          ; A space is always the end of a token whether it is the only character or ends text.
+        BEQ     PTMKSDN 
+        CMP A   #REALCR     ; A CR character also ends a token whether it is alone or ends text.
+        BEQ     PTMKSDN         
+        INX                 ; Token keeps going.
+        BRA     PTMKS1
+PTMKSDN RTS        
 
 ;------------------------------------------------------------------------------
 ;
@@ -1969,7 +2024,7 @@ RFLEND  *                   ; this is the end of the reflow buffer
 
 STITLE  DS      "      S C R I P T O R"
         FCB     0
-SAUTHR  DS      "     BY BEN ZOTTO 2023 "
+SAUTHR  DS      "     BY BEN ZOTTO 2024 "
         FCB     0
 SSAVE   DS      "SAVE DOCUMENT TO TAPE?"
         FCB     0
